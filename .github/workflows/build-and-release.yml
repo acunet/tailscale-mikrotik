@@ -20,7 +20,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
@@ -32,6 +32,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Log in to Container Registry
         uses: docker/login-action@v3
         with:
@@ -40,40 +43,73 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract version
-        id: version
+        id: meta
         run: |
-          # Extract VERSION from build.sh
           VERSION=$(grep '^VERSION=' build.sh | cut -d'=' -f2)
+          TAILSCALE_VERSION=$(grep '^TAILSCALE_VERSION=' build.sh | cut -d'=' -f2)
+          case "$TAILSCALE_VERSION" in
+            v*) TS_GIT_REF="$TAILSCALE_VERSION" ;;
+            *) TS_GIT_REF="v$TAILSCALE_VERSION" ;;
+          esac
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tailscale_version=${TAILSCALE_VERSION}" >> $GITHUB_OUTPUT
+          echo "ts_git_ref=${TS_GIT_REF}" >> $GITHUB_OUTPUT
           echo "Building version: ${VERSION}"
+
+      - name: Prepare tailscale source
+        run: |
+          if [ ! -f tailscale/go.mod ] || [ ! -f tailscale/go.sum ]; then
+            rm -rf tailscale
+            git -c advice.detachedHead=false clone https://github.com/tailscale/tailscale.git --branch "${{ steps.meta.outputs.ts_git_ref }}" tailscale
+          fi
+          test -f tailscale/go.mod
+          test -f tailscale/go.sum
+
+      - name: Compute tailscale build metadata
+        id: tsvars
+        run: |
+          (
+            cd tailscale
+            TS_USE_TOOLCHAIN="Y"
+            eval "$(./build_dist.sh shellvars)"
+            echo "version_long=$VERSION_LONG" >> "$GITHUB_OUTPUT"
+            echo "version_short=$VERSION_SHORT" >> "$GITHUB_OUTPUT"
+            echo "version_git_hash=$VERSION_GIT_HASH" >> "$GITHUB_OUTPUT"
+          )
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+          platforms: linux/arm64
+          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            TAILSCALE_VERSION=${{ steps.meta.outputs.tailscale_version }}
+            VERSION_LONG=${{ steps.tsvars.outputs.version_long }}
+            VERSION_SHORT=${{ steps.tsvars.outputs.version_short }}
+            VERSION_GIT_HASH=${{ steps.tsvars.outputs.version_git_hash }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Build Docker image locally for export
         run: |
           docker buildx build \
-            --load \
-            --build-arg TAILSCALE_VERSION=$(grep '^TAILSCALE_VERSION=' build.sh | cut -d'=' -f2) \
-            --build-arg VERSION_LONG="$(cd tailscale && eval $(./build_dist.sh shellvars) && echo $VERSION_LONG)" \
-            --build-arg VERSION_SHORT="$(cd tailscale && eval $(./build_dist.sh shellvars) && echo $VERSION_SHORT)" \
-            --build-arg VERSION_GIT_HASH="$(cd tailscale && eval $(./build_dist.sh shellvars) && echo $VERSION_GIT_HASH)" \
-            -t tailscale-mikrotik:local \
+            --platform linux/arm64 \
+            --build-arg TAILSCALE_VERSION="${{ steps.meta.outputs.tailscale_version }}" \
+            --build-arg VERSION_LONG="${{ steps.tsvars.outputs.version_long }}" \
+            --build-arg VERSION_SHORT="${{ steps.tsvars.outputs.version_short }}" \
+            --build-arg VERSION_GIT_HASH="${{ steps.tsvars.outputs.version_git_hash }}" \
+            --output type=docker,dest=tailscale-mikrotik.tar \
             .
-          docker save tailscale-mikrotik:local -o tailscale-mikrotik.tar.gz
+          gzip -f tailscale-mikrotik.tar
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tailscale-mikrotik-${{ steps.version.outputs.version }}
+          name: tailscale-mikrotik-${{ steps.meta.outputs.version }}
           path: tailscale-mikrotik.tar.gz
 
       - name: Create Release
@@ -81,12 +117,12 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: tailscale-mikrotik.tar.gz
-          tag_name: v${{ steps.version.outputs.version }}
-          name: Release ${{ steps.version.outputs.version }}
+          tag_name: v${{ steps.meta.outputs.version }}
+          name: Release ${{ steps.meta.outputs.version }}
           body: |
             ## Docker Image
             ```
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
             ```
 
             ## Changes
